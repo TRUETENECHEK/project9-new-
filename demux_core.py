@@ -37,7 +37,7 @@ def find_best_alignment(sequence: str, query: str, min_score_ratio: float = 0.5)
         start = int(target_coords[0][0])
         end = int(target_coords[-1][1])
         # Примерный расчет ошибок: каждая ошибка уменьшает макс. скор примерно на 3
-        errs = max(0, int((max_score - best.score) / 3))
+        errs = max(0, round((max_score - best.score) / 3.0))
         return start, end, errs
     return None
 
@@ -114,7 +114,7 @@ def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str
         if ratio >= 0.4 and ratio > best_score_ratio:
             best_score_ratio = ratio
             best_id = b_id
-            best_errs = max(0, int((max_score - score) / 3))
+            best_errs = max(0, round((max_score - score) / 3.0))
 
     return best_id, best_errs
 
@@ -157,8 +157,23 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    fbs_rc = {k: get_reverse_complement(v) for k, v in fbs.items()}
-    rbs_rc = {k: get_reverse_complement(v) for k, v in rbs.items()}
+    # Очищаем баркоды от универсальных адаптеров, так как они ищутся отдельно в anchors
+    fbs_clean = {}
+    for k, v in fbs.items():
+        if v.endswith(UNIVERSAL_FWD_ADAPTER):
+            fbs_clean[k] = v[:-len(UNIVERSAL_FWD_ADAPTER)]
+        else:
+            fbs_clean[k] = v
+
+    rbs_clean = {}
+    for k, v in rbs.items():
+        if v.endswith(UNIVERSAL_REV_ADAPTER):
+            rbs_clean[k] = v[:-len(UNIVERSAL_REV_ADAPTER)]
+        else:
+            rbs_clean[k] = v
+
+    fbs_rc = {k: get_reverse_complement(v) for k, v in fbs_clean.items()}
+    rbs_rc = {k: get_reverse_complement(v) for k, v in rbs_clean.items()}
 
     stats = {
         "total": 0, "demuxed": 0, "unassigned": 0,
@@ -178,7 +193,7 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
                     f"\rОбработано: {stats['total']} | Распознано: {stats['demuxed']} | Мусор: {stats['unassigned']}     ")
                 sys.stdout.flush()
 
-            res = process_read(seq, fbs, rbs, fbs_rc, rbs_rc)
+            res = process_read(seq, fbs_clean, rbs_clean, fbs_rc, rbs_rc)
 
             if res:
                 s_id = res["sample_id"]

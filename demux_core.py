@@ -1,5 +1,6 @@
 import regex
 import os
+import sys
 from Bio import Align
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
 from typing import Dict, Tuple, Optional
@@ -9,20 +10,17 @@ from utils import get_reverse_complement
 UNIVERSAL_FWD_ADAPTER = "TGTTGGTGCAGATATTGCGGG"
 UNIVERSAL_REV_ADAPTER = "TTGCCTGTCGCTCTATCTTCAAA"
 
-# 1. Возвращаем МЯГКИЕ лимиты на якоря (до 10 ошибок суммарно)
-# Так как мы ищем оба якоря по краям, риск химер минимален, но мы спасаем грязные риды
 ANCHOR_ERRORS = "{e<=10}"
-SEARCH_WINDOW = 120  # Расширили окно поиска, на случай если фланки длинные
+SEARCH_WINDOW = 120
 
-# 2. Настраиваем ту самую умную систему штрафов для баркодов
+# Настройка алайнера
 aligner = Align.PairwiseAligner()
 aligner.mode = 'local'
-aligner.match_score = 2  # Награда за совпадение
-aligner.mismatch_score = -1  # Штраф за замену
-aligner.open_gap_score = -10  # Мощный штраф за индел (гэп)
+aligner.match_score = 2
+aligner.mismatch_score = -1
+aligner.open_gap_score = -10
 aligner.extend_gap_score = -10
 
-# Прекомпиляция адаптеров
 FWD_RC = get_reverse_complement(UNIVERSAL_FWD_ADAPTER)
 REV_RC = get_reverse_complement(UNIVERSAL_REV_ADAPTER)
 
@@ -33,14 +31,12 @@ REG_FWD_RC = regex.compile(f"(?b)({FWD_RC}){ANCHOR_ERRORS}")
 
 
 def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[regex.Match], Optional[regex.Match], int]:
-    """Быстрый поиск грязных адаптеров по краям."""
     seq_len = len(sequence)
     if seq_len < SEARCH_WINDOW * 2:
         return None, None, None, 0
 
     end_zone = seq_len - SEARCH_WINDOW
 
-    # PLUS-ориентация
     m_fwd = REG_FWD.search(sequence, 0, SEARCH_WINDOW)
     if m_fwd:
         m_rev_rc = REG_REV_RC.search(sequence, end_zone)
@@ -48,7 +44,6 @@ def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[regex.Match], O
             errs = sum(m_fwd.fuzzy_counts) + sum(m_rev_rc.fuzzy_counts)
             return "PLUS", m_fwd, m_rev_rc, errs
 
-    # MINUS-ориентация
     m_rev = REG_REV.search(sequence, 0, SEARCH_WINDOW)
     if m_rev:
         m_fwd_rc = REG_FWD_RC.search(sequence, end_zone)
@@ -60,7 +55,6 @@ def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[regex.Match], O
 
 
 def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str], int]:
-    """Умный выбор баркода с учетом системы штрафов и динамического порога."""
     if not flank:
         return None, 0
 
@@ -69,18 +63,27 @@ def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str
     best_errs_approx = 0
 
     for b_id, b_seq in barcodes.items():
-        score = aligner.score(flank, b_seq)
         max_possible_score = len(b_seq) * aligner.match_score
 
-        # Очень мягкий порог прохождения (достаточно набрать 30% от идеала),
-        # но за счет best_score мы всегда выберем сильнейшего кандидата
+        # --- ТУРБО-БУСТ ---
+        # Простой поиск подстроки работает в 100 раз быстрее алайнера.
+        # Если баркод идеальный, мы просто забираем его и экономим процессорное время.
+        if b_seq in flank:
+            return b_id, 0
+            # ------------------
+
+        score = aligner.score(flank, b_seq)
         min_passing_score = max_possible_score * 0.3
 
         if score >= min_passing_score and score > best_score:
             best_score = score
             best_id = b_id
-            # Имитируем кол-во ошибок для красивых графиков в seaborn
             best_errs_approx = max(0, int((max_possible_score - score) / 3))
+
+            # --- РАННИЙ ВЫХОД ---
+            # Если скор идеальный, дальше искать нет смысла
+            if score == max_possible_score:
+                break
 
     return best_id, best_errs_approx
 
@@ -97,7 +100,7 @@ def process_read(sequence: str, fbs: dict, rbs: dict, fbs_rc: dict, rbs_rc: dict
         found_fb, fb_err = get_best_barcode(fb_flank, fbs)
         found_rb, rb_err = get_best_barcode(rb_flank, rbs_rc)
 
-    else:  # MINUS
+    else:
         rb_flank = sequence[:m1.start()]
         fb_flank = sequence[m2.end():]
 
@@ -122,21 +125,24 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
     fbs_rc = {k: get_reverse_complement(v) for k, v in fbs.items()}
     rbs_rc = {k: get_reverse_complement(v) for k, v in rbs.items()}
 
-    # Структура словаря четко под твою visualization.py
     stats = {
         "total": 0, "demuxed": 0, "unassigned": 0,
         "sample_counts": {},
-        "error_distribution": {i: 0 for i in range(35)}  # расширил до 35 ошибок на всякий случай
+        "error_distribution": {i: 0 for i in range(35)}
     }
     handles = {}
 
-    print("Анализ ридов запущен...")
+    print("Анализ ридов запущен...\n")  # Добавил перенос строки для красоты логгера
 
     with open(fastq_path, "r") as handle:
         for title, seq, qual in FastqGeneralIterator(handle):
             stats["total"] += 1
-            if stats["total"] % 5000 == 0:
-                print(f"Обработано {stats['total']} ридов...", end="\r")
+
+            # --- ЖИВОЙ ТРЕКЕР ПРОГРЕССА (Каждые 1000 ридов) ---
+            if stats["total"] % 1000 == 0:
+                sys.stdout.write(
+                    f"\rОбработано: {stats['total']} | Распознано: {stats['demuxed']} | Мусор: {stats['unassigned']}     ")
+                sys.stdout.flush()
 
             res = process_read(seq, fbs, rbs, fbs_rc, rbs_rc)
 
@@ -165,5 +171,7 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
 
     for h in handles.values():
         h.close()
+
+    print()  # Финальный перенос строки после завершения логгера
 
     return stats

@@ -10,22 +10,23 @@ def plot_statistics(stats: dict, output_dir: str):
     ax1 = plt.subplot(2, 2, (1, 2))
     samples = list(stats["sample_counts"].keys())
     counts = list(stats["sample_counts"].values())
-    sns.barplot(x=samples, y=counts, ax=ax1, palette="viridis")
+    sns.barplot(x=samples, y=counts, ax=ax1, palette="viridis", hue=samples, legend=False)
     ax1.set_title("Количество ридов по образцам")
-    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right')
+    ax1.set_xticks(range(len(samples)))
+    ax1.set_xticklabels(samples, rotation=45, ha="right")
 
     # 2. Успешность демультиплексации (Pie chart)
     ax2 = plt.subplot(2, 2, 3)
-    labels = ['Распознано', 'Не распознано']
+    labels = ["Распознано", "Не распознано"]
     sizes = [stats["demuxed"], stats["unassigned"]]
-    ax2.pie(sizes, labels=labels, autopct='%1.1f%%', colors=['#4CAF50', '#F44336'])
+    ax2.pie(sizes, labels=labels, autopct="%1.1f%%", colors=["#4CAF50", "#F44336"])
     ax2.set_title("Общая успешность пайплайна")
 
     # 3. Распределение ошибок в адаптерах
     ax3 = plt.subplot(2, 2, 4)
     err_labels = list(stats["error_distribution"].keys())
     err_counts = list(stats["error_distribution"].values())
-    sns.barplot(x=err_labels, y=err_counts, ax=ax3, palette="mako")
+    sns.barplot(x=err_labels, y=err_counts, ax=ax3, palette="mako", hue=err_labels, legend=False)
     ax3.set_title("Количество допущенных ошибок при поиске")
     ax3.set_xlabel("Суммарно ошибок (mismatch/indel)")
 

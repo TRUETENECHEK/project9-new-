@@ -82,41 +82,51 @@ def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[Tuple[int, int]
     return None, None, None, 0
 
 
-def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str], int]:
-    """Умный отбор баркода: перебирает все и выбирает лучший по штрафам."""
+def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str], int, dict]:
     if not flank:
-        return None, 0
+        return None, 0, {}
 
     best_id = None
     best_score_ratio = -float('inf')
     best_errs = 0
+    best_details = {}
 
-    # Проходим по всем баркодам и выбираем ТОТ, У КОТОРОГО ЛУЧШИЙ СКОР
     for b_id, b_seq in barcodes.items():
         max_score = len(b_seq) * aligner.match_score
         
-        # Турбо-буст: если идеальное совпадение, проверяем, не перебьет ли это предыдущий лучший
         if b_seq in flank:
             if 1.0 > best_score_ratio:
                 best_score_ratio = 1.0
                 best_id = b_id
                 best_errs = 0
+                best_details = {'mismatches': 0, 'gaps': 0, 'penalty': 0, 'len': len(b_seq)}
             continue
 
         alns = aligner.align(flank, b_seq)
         if not alns:
             continue
         
-        score = alns[0].score
+        best_aln = alns[0]
+        score = best_aln.score
         ratio = score / max_score
         
-        # Минимальный порог 40% совпадения, но ищем максимум!
         if ratio >= 0.4 and ratio > best_score_ratio:
             best_score_ratio = ratio
             best_id = b_id
-            best_errs = max(0, round((max_score - score) / 3.0))
+            penalty = max(0, max_score - score)
+            best_errs = max(0, round(penalty / 3.0))
+            
+            try:
+                counts = best_aln.counts()
+                m = counts.mismatches
+                g = counts.query_insertions + counts.target_insertions
+            except:
+                m = 0
+                g = 0
+            
+            best_details = {'mismatches': m, 'gaps': g, 'penalty': penalty, 'len': len(b_seq)}
 
-    return best_id, best_errs
+    return best_id, best_errs, best_details
 
 
 def process_read(sequence: str, fbs: dict, rbs: dict, fbs_rc: dict, rbs_rc: dict) -> Optional[dict]:
@@ -132,23 +142,31 @@ def process_read(sequence: str, fbs: dict, rbs: dict, fbs_rc: dict, rbs_rc: dict
         fb_flank = sequence[:m1_start]
         rb_flank = sequence[m2_end:]
 
-        found_fb, fb_err = get_best_barcode(fb_flank, fbs)
-        found_rb, rb_err = get_best_barcode(rb_flank, rbs_rc)
+        found_fb, fb_err, fb_det = get_best_barcode(fb_flank, fbs)
+        found_rb, rb_err, rb_det = get_best_barcode(rb_flank, rbs_rc)
 
     else:
         rb_flank = sequence[:m1_start]
         fb_flank = sequence[m2_end:]
 
-        found_rb, rb_err = get_best_barcode(rb_flank, rbs)
-        found_fb, fb_err = get_best_barcode(fb_flank, fbs_rc)
+        found_rb, rb_err, rb_det = get_best_barcode(rb_flank, rbs)
+        found_fb, fb_err, fb_det = get_best_barcode(fb_flank, fbs_rc)
 
     if found_fb and found_rb:
+        tot_len = fb_det.get('len', 1) + rb_det.get('len', 1)
+        tot_mismatches = fb_det.get('mismatches', 0) + rb_det.get('mismatches', 0)
+        tot_gaps = fb_det.get('gaps', 0) + rb_det.get('gaps', 0)
+        tot_penalty = fb_det.get('penalty', 0) + rb_det.get('penalty', 0)
+        
         return {
             "sample_id": f"{found_fb}_{found_rb}",
             "orientation": orientation,
             "trim_start": m1_end,
             "trim_end": m2_start,
-            "total_errors": anchor_errs + fb_err + rb_err
+            "total_errors": anchor_errs + fb_err + rb_err,
+            "b_mismatches_perc": round((tot_mismatches / tot_len) * 100, 2) if tot_len else 0,
+            "b_gaps_perc": round((tot_gaps / tot_len) * 100, 2) if tot_len else 0,
+            "b_penalty": tot_penalty
         }
     return None
 
@@ -178,7 +196,9 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
     stats = {
         "total": 0, "demuxed": 0, "unassigned": 0,
         "sample_counts": {},
-        "error_distribution": {i: 0 for i in range(35)}
+        "sample_lengths": {},
+        "error_distribution": {i: 0 for i in range(35)},
+        "benchmark_data": []
     }
     handles = {}
 
@@ -199,6 +219,10 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
                 s_id = res["sample_id"]
                 stats["demuxed"] += 1
                 stats["sample_counts"][s_id] = stats["sample_counts"].get(s_id, 0) + 1
+                
+                t_start, t_end = res["trim_start"], res["trim_end"]
+                trimmed_len = t_end - t_start
+                stats["sample_lengths"][s_id] = stats["sample_lengths"].get(s_id, 0) + trimmed_len
 
                 err_idx = min(res["total_errors"], 34)
                 stats["error_distribution"][err_idx] += 1
@@ -215,6 +239,16 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
                     trimmed_qual = trimmed_qual[::-1]
 
                 handles[s_id].write(f"@{title}\n{trimmed_seq}\n+\n{trimmed_qual}\n")
+                
+                # Limit benchmark data to save memory, e.g. up to 10000 reads or we can just append all since pandas can handle 50k
+                stats["benchmark_data"].append({
+                    "SampleID": s_id,
+                    "Orientation": res["orientation"],
+                    "Trimmed_Sequence": trimmed_seq,
+                    "Mismatches_Perc": res.get("b_mismatches_perc", 0),
+                    "Gaps_Perc": res.get("b_gaps_perc", 0),
+                    "Total_Penalty": res.get("b_penalty", 0)
+                })
             else:
                 stats["unassigned"] += 1
 

@@ -1,4 +1,3 @@
-import regex
 import os
 import sys
 from Bio import Align
@@ -10,99 +9,135 @@ from utils import get_reverse_complement
 UNIVERSAL_FWD_ADAPTER = "TGTTGGTGCAGATATTGCGGG"
 UNIVERSAL_REV_ADAPTER = "TTGCCTGTCGCTCTATCTTCAAA"
 
-ANCHOR_ERRORS = "{e<=10}"
 SEARCH_WINDOW = 120
-
-# Настройка алайнера
-aligner = Align.PairwiseAligner()
-aligner.mode = 'local'
-aligner.match_score = 2
-aligner.mismatch_score = -1
-aligner.open_gap_score = -10
-aligner.extend_gap_score = -10
 
 FWD_RC = get_reverse_complement(UNIVERSAL_FWD_ADAPTER)
 REV_RC = get_reverse_complement(UNIVERSAL_REV_ADAPTER)
 
-REG_FWD = regex.compile(f"(?b)({UNIVERSAL_FWD_ADAPTER}){ANCHOR_ERRORS}")
-REG_REV_RC = regex.compile(f"(?b)({REV_RC}){ANCHOR_ERRORS}")
-REG_REV = regex.compile(f"(?b)({UNIVERSAL_REV_ADAPTER}){ANCHOR_ERRORS}")
-REG_FWD_RC = regex.compile(f"(?b)({FWD_RC}){ANCHOR_ERRORS}")
+# Настройка алайнера для адаптеров и баркодов
+# Более мягкие штрафы, чтобы справляться с "грязными" данными и находить ЛУЧШЕЕ выравнивание
+aligner = Align.PairwiseAligner()
+aligner.mode = 'local'
+aligner.match_score = 2
+aligner.mismatch_score = -1
+aligner.open_gap_score = -3
+aligner.extend_gap_score = -1
 
 
-def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[regex.Match], Optional[regex.Match], int]:
+def find_best_alignment(sequence: str, query: str, min_score_ratio: float = 0.5) -> Optional[Tuple[int, int, int]]:
+    """Находит лучшее локальное выравнивание и возвращает координаты и примерное количество ошибок."""
+    alns = aligner.align(sequence, query)
+    if not alns:
+        return None
+    best = alns[0]
+    max_score = len(query) * aligner.match_score
+    if best.score >= max_score * min_score_ratio:
+        # Получаем координаты выравнивания в целевой последовательности
+        target_coords = best.aligned[0]
+        start = int(target_coords[0][0])
+        end = int(target_coords[-1][1])
+        # Примерный расчет ошибок: каждая ошибка уменьшает макс. скор примерно на 3
+        errs = max(0, int((max_score - best.score) / 3))
+        return start, end, errs
+    return None
+
+
+def find_anchors(sequence: str) -> Tuple[Optional[str], Optional[Tuple[int, int]], Optional[Tuple[int, int]], int]:
+    """Ищет универсальные адаптеры с обоих концов рида, учитывая инверсию цепи."""
     seq_len = len(sequence)
     if seq_len < SEARCH_WINDOW * 2:
         return None, None, None, 0
 
-    end_zone = seq_len - SEARCH_WINDOW
+    end_zone_start = seq_len - SEARCH_WINDOW
+    start_seq = sequence[:SEARCH_WINDOW]
+    end_seq = sequence[-SEARCH_WINDOW:]
 
-    m_fwd = REG_FWD.search(sequence, 0, SEARCH_WINDOW)
-    if m_fwd:
-        m_rev_rc = REG_REV_RC.search(sequence, end_zone)
-        if m_rev_rc:
-            errs = sum(m_fwd.fuzzy_counts) + sum(m_rev_rc.fuzzy_counts)
-            return "PLUS", m_fwd, m_rev_rc, errs
+    # Ищем адаптеры. Требуем хотя бы 55% сходства
+    min_anchor_ratio = 0.55
 
-    m_rev = REG_REV.search(sequence, 0, SEARCH_WINDOW)
-    if m_rev:
-        m_fwd_rc = REG_FWD_RC.search(sequence, end_zone)
-        if m_fwd_rc:
-            errs = sum(m_rev.fuzzy_counts) + sum(m_fwd_rc.fuzzy_counts)
-            return "MINUS", m_rev, m_fwd_rc, errs
+    # Проверка PLUS цепи: FWD в начале, REV_RC в конце
+    res_fwd = find_best_alignment(start_seq, UNIVERSAL_FWD_ADAPTER, min_anchor_ratio)
+    if res_fwd:
+        res_rev_rc = find_best_alignment(end_seq, REV_RC, min_anchor_ratio)
+        if res_rev_rc:
+            start_fwd, end_fwd, err_fwd = res_fwd
+            start_rev_rc, end_rev_rc, err_rev_rc = res_rev_rc
+            
+            m1_coords = (start_fwd, end_fwd)
+            m2_coords = (end_zone_start + start_rev_rc, end_zone_start + end_rev_rc)
+            return "PLUS", m1_coords, m2_coords, err_fwd + err_rev_rc
+
+    # Проверка MINUS цепи: REV в начале, FWD_RC в конце
+    res_rev = find_best_alignment(start_seq, UNIVERSAL_REV_ADAPTER, min_anchor_ratio)
+    if res_rev:
+        res_fwd_rc = find_best_alignment(end_seq, FWD_RC, min_anchor_ratio)
+        if res_fwd_rc:
+            start_rev, end_rev, err_rev = res_rev
+            start_fwd_rc, end_fwd_rc, err_fwd_rc = res_fwd_rc
+            
+            m1_coords = (start_rev, end_rev)
+            m2_coords = (end_zone_start + start_fwd_rc, end_zone_start + end_fwd_rc)
+            return "MINUS", m1_coords, m2_coords, err_rev + err_fwd_rc
 
     return None, None, None, 0
 
 
 def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str], int]:
+    """Умный отбор баркода: перебирает все и выбирает лучший по штрафам."""
     if not flank:
         return None, 0
 
     best_id = None
-    best_score = -float('inf')
-    best_errs_approx = 0
+    best_score_ratio = -float('inf')
+    best_errs = 0
 
+    # Проходим по всем баркодам и выбираем ТОТ, У КОТОРОГО ЛУЧШИЙ СКОР
     for b_id, b_seq in barcodes.items():
-        max_possible_score = len(b_seq) * aligner.match_score
-
-        # --- ТУРБО-БУСТ ---
-        # Простой поиск подстроки работает в 100 раз быстрее алайнера.
-        # Если баркод идеальный, мы просто забираем его и экономим процессорное время.
+        max_score = len(b_seq) * aligner.match_score
+        
+        # Турбо-буст: если идеальное совпадение, проверяем, не перебьет ли это предыдущий лучший
         if b_seq in flank:
-            return b_id, 0
-            # ------------------
+            if 1.0 > best_score_ratio:
+                best_score_ratio = 1.0
+                best_id = b_id
+                best_errs = 0
+            continue
 
-        score = aligner.score(flank, b_seq)
-        min_passing_score = max_possible_score * 0.3
-
-        if score >= min_passing_score and score > best_score:
-            best_score = score
+        alns = aligner.align(flank, b_seq)
+        if not alns:
+            continue
+        
+        score = alns[0].score
+        ratio = score / max_score
+        
+        # Минимальный порог 40% совпадения, но ищем максимум!
+        if ratio >= 0.4 and ratio > best_score_ratio:
+            best_score_ratio = ratio
             best_id = b_id
-            best_errs_approx = max(0, int((max_possible_score - score) / 3))
+            best_errs = max(0, int((max_score - score) / 3))
 
-            # --- РАННИЙ ВЫХОД ---
-            # Если скор идеальный, дальше искать нет смысла
-            if score == max_possible_score:
-                break
-
-    return best_id, best_errs_approx
+    return best_id, best_errs
 
 
 def process_read(sequence: str, fbs: dict, rbs: dict, fbs_rc: dict, rbs_rc: dict) -> Optional[dict]:
+    """Полный цикл обработки одного рида."""
     orientation, m1, m2, anchor_errs = find_anchors(sequence)
     if not orientation:
         return None
 
+    m1_start, m1_end = m1
+    m2_start, m2_end = m2
+
     if orientation == "PLUS":
-        fb_flank = sequence[:m1.start()]
-        rb_flank = sequence[m2.end():]
+        fb_flank = sequence[:m1_start]
+        rb_flank = sequence[m2_end:]
 
         found_fb, fb_err = get_best_barcode(fb_flank, fbs)
         found_rb, rb_err = get_best_barcode(rb_flank, rbs_rc)
 
     else:
-        rb_flank = sequence[:m1.start()]
-        fb_flank = sequence[m2.end():]
+        rb_flank = sequence[:m1_start]
+        fb_flank = sequence[m2_end:]
 
         found_rb, rb_err = get_best_barcode(rb_flank, rbs)
         found_fb, fb_err = get_best_barcode(fb_flank, fbs_rc)
@@ -111,8 +146,8 @@ def process_read(sequence: str, fbs: dict, rbs: dict, fbs_rc: dict, rbs_rc: dict
         return {
             "sample_id": f"{found_fb}_{found_rb}",
             "orientation": orientation,
-            "trim_start": m1.end(),
-            "trim_end": m2.start(),
+            "trim_start": m1_end,
+            "trim_end": m2_start,
             "total_errors": anchor_errs + fb_err + rb_err
         }
     return None
@@ -132,13 +167,12 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
     }
     handles = {}
 
-    print("Анализ ридов запущен...\n")  # Добавил перенос строки для красоты логгера
+    print("Анализ ридов запущен...\n")
 
     with open(fastq_path, "r") as handle:
         for title, seq, qual in FastqGeneralIterator(handle):
             stats["total"] += 1
 
-            # --- ЖИВОЙ ТРЕКЕР ПРОГРЕССА (Каждые 1000 ридов) ---
             if stats["total"] % 1000 == 0:
                 sys.stdout.write(
                     f"\rОбработано: {stats['total']} | Распознано: {stats['demuxed']} | Мусор: {stats['unassigned']}     ")
@@ -172,6 +206,5 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
     for h in handles.values():
         h.close()
 
-    print()  # Финальный перенос строки после завершения логгера
-
+    print("\n")
     return stats

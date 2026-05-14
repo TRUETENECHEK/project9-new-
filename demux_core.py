@@ -119,7 +119,7 @@ def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str
             try:
                 counts = best_aln.counts()
                 m = counts.mismatches
-                g = counts.query_insertions + counts.target_insertions
+                g = counts.insertions + counts.deletions
             except:
                 m = 0
                 g = 0

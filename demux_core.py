@@ -5,7 +5,7 @@ from Bio.SeqIO.QualityIO import FastqGeneralIterator
 from typing import Dict, Tuple, Optional
 from utils import get_reverse_complement
 
-# --- КОНСТАНТЫ И НАСТРОЙКИ ---
+
 UNIVERSAL_FWD_ADAPTER = "TGTTGGTGCAGATATTGCGGG"
 UNIVERSAL_REV_ADAPTER = "TTGCCTGTCGCTCTATCTTCAAA"
 
@@ -14,8 +14,7 @@ SEARCH_WINDOW = 120
 FWD_RC = get_reverse_complement(UNIVERSAL_FWD_ADAPTER)
 REV_RC = get_reverse_complement(UNIVERSAL_REV_ADAPTER)
 
-# Настройка алайнера для адаптеров и баркодов
-# Более мягкие штрафы, чтобы справляться с "грязными" данными и находить ЛУЧШЕЕ выравнивание
+# Настройка параметров выравнивания
 aligner = Align.PairwiseAligner()
 aligner.mode = 'local'
 aligner.match_score = 2
@@ -120,7 +119,7 @@ def get_best_barcode(flank: str, barcodes: Dict[str, str]) -> Tuple[Optional[str
                 counts = best_aln.counts()
                 m = counts.mismatches
                 g = counts.insertions + counts.deletions
-            except:
+            except Exception:
                 m = 0
                 g = 0
             
@@ -210,7 +209,7 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
 
             if stats["total"] % 1000 == 0:
                 sys.stdout.write(
-                    f"\rОбработано: {stats['total']} | Распознано: {stats['demuxed']} | Мусор: {stats['unassigned']}     ")
+                    f"\rОбработано: {stats['total']} | Распознано: {stats['demuxed']} | Не распознано: {stats['unassigned']}     ")
                 sys.stdout.flush()
 
             res = process_read(seq, fbs_clean, rbs_clean, fbs_rc, rbs_rc)
@@ -240,7 +239,6 @@ def run_demux(fastq_path: str, fbs: Dict[str, str], rbs: Dict[str, str], output_
 
                 handles[s_id].write(f"@{title}\n{trimmed_seq}\n+\n{trimmed_qual}\n")
                 
-                # Limit benchmark data to save memory, e.g. up to 10000 reads or we can just append all since pandas can handle 50k
                 stats["benchmark_data"].append({
                     "SampleID": s_id,
                     "Orientation": res["orientation"],

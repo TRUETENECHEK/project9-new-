@@ -2,7 +2,7 @@ import pandas as pd
 import os
 from utils import parse_barcodes
 from demux_core import run_demux
-from visualization import plot_statistics  # Возвращаем отрисовку
+from visualization import plot_statistics
 from errors_visual import visualize_errors
 
 IN_FASTQ = "read_file/test_reads.fastq"
@@ -16,10 +16,9 @@ def main():
     # Запуск движка
     stats = run_demux(IN_FASTQ, fbs, rbs, OUT_DIR)
 
-    print(f"\n✅ Завершено! Всего ридов: {stats['total']}")
-    print(f"🧬 Демультиплексировано: {stats['demuxed']}")
-    print(f"🗑️ Мусор/Не распознано: {stats['unassigned']}")
-    # Запуск твоей визулизации
+    print(f"\nЗавершено! Всего ридов: {stats['total']}")
+    print(f"Демультиплексировано: {stats['demuxed']}")
+    print(f"Не распознано: {stats['unassigned']}")
     print("Генерация графиков...")
     plot_statistics(stats, OUT_DIR)
 
@@ -46,7 +45,7 @@ def main():
     df = pd.DataFrame(report_data) if report_data else pd.DataFrame()
 
     if stats.get('benchmark_data'):
-        print("Генерация Benchmark Excel отчета и расчет средних ошибок...")
+        print("Расчет средних ошибок...")
         df_bench = pd.DataFrame(stats['benchmark_data'])
         bench_path = os.path.join(OUT_DIR, 'benchmark_trimmed_sequences.xlsx')
         df_bench.to_excel(bench_path, index=False)
